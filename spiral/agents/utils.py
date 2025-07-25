@@ -112,10 +112,25 @@ def simple_negotiation_parse_available_actions(observation: str):
     return valid_actions if valid_actions else ["I'll think about my options."]
 
 
+def leduc_holdem_parse_available_actions(observation: str):
+    last_line = observation.strip().split("\n")[-1]
+    
+    # Look for the available actions line
+    if "your available actions:" in last_line.lower():
+        # Extract actions from the line like "Player 0, your available actions: [Check], [Bet]"
+        actions_part = last_line.split(":")[-1].strip()
+        available_actions = re.findall(r"\[([^\]]+)\]", actions_part)
+        return [f"[{action}]" for action in available_actions]
+    
+    # If no available actions found, return all possible actions
+    return ["[Check]", "[Bet]", "[Call]", "[Raise]", "[Fold]"]
+
+
 _VALID_ACTION_PARSER = {
     "TicTacToe-v0": tic_tac_toe_parse_available_moves,
     "KuhnPoker-v1": kuhn_poker_parse_available_actions,
     "SimpleNegotiation-v1": simple_negotiation_parse_available_actions,
+    "LeducHoldem-v1": leduc_holdem_parse_available_actions,
 }
 
 

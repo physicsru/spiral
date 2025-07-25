@@ -53,6 +53,13 @@ register(
     max_turns=50,
 )
 
+# Leduc Hold'em (two-player)
+register(
+    id="LeducHoldem-v1",
+    entry_point="spiral.envs.LeducHoldem.env:LeducHoldemEnv",
+    max_rounds=1,
+)
+
 
 def make_env(env_id: str, use_llm_obs_wrapper: bool):
     env = ta.make(env_id)

@@ -185,3 +185,16 @@ evals/benchmarks/*/data*
 evals/benchmarks/wandb*
 evals/benchmarks/*/eval_res*
 evals/game/results*
+*out
+path*
+*err
+spiral-qwen3-4b-base-kp-4k-gto-training-alpha_0/*
+spiral-qwen3-4b-base-kp-4k-gto-training/*
+spiral-qwen3-4b-base-kp-4k-self-play_v1/*
+spiral-qwen3-4b-base-leduc-holdem-4k-self-play/*
+spiral-qwen3-4b-base-leduc-holdem-4k-self-play-alpha_0/*
+*sh
+*json
+*png
+analysis_*
+.d000*

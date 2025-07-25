@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Self-Play Reinforcement Learning Pipeline using OAT and TextArena."""
+"""GTO Training Pipeline using OAT and TextArena with CFR+ opponent."""
 
 import functools
 import json
@@ -55,23 +55,31 @@ INVALID_ACTION = "[｜INVALID_ACTION｜]"
 
 
 """
-1. Define extra arguments needed besides Oat's PPOArgs, mainly about self-play configurations.
+1. CFR+ Agent using modular implementation
+"""
+
+from spiral.cfr.agent import KuhnPokerCFRAgent, LeducHoldemCFRAgent
+
+# For backward compatibility, alias the KuhnPokerCFRAgent as CFRPlusAgent
+CFRPlusAgent = KuhnPokerCFRAgent
+
+
+"""
+2. Define extra arguments needed besides Oat's PPOArgs, mainly about GTO training configurations.
 """
 
 
 @dataclass
-class SelfPlayArgs(PPOArgs):
+class GTOTrainingArgs(PPOArgs):
     # Environment settings
     env_id: Literal["TicTacToe-v0", "KuhnPoker-v1", "SimpleNegotiation-v1", "LeducHoldem-v1"] = (
         "KuhnPoker-v1"
     )
     use_llm_obs_wrapper: bool = True  # Encode opponent history in the obs
 
-    # Self-play specific settings
+    # GTO training specific settings
     num_envs: int = 1
-    fixed_opponent: Literal[
-        "", "random", "google/gemini-2.0-flash-lite-001", "google/gemini-2.0-flash-001"
-    ] = ""
+    cfr_strategy_path: str = ""  # Path to CFR+ strategy file
     filter_zero_adv: bool = (
         True  # Make gradient less noisy by filtering zero-gradient trajectories
     )
@@ -81,11 +89,11 @@ class SelfPlayArgs(PPOArgs):
     # Game evaluation
     eval_games: int = 16  # Number of games for evaluation
     eval_env_ids: List[str] = field(
-        default_factory=lambda: ["TicTacToe-v0", "KuhnPoker-v1", "SimpleNegotiation-v1", "LeducHoldem-v1"]
+        default_factory=lambda: ["KuhnPoker-v1", "LeducHoldem-v1"]
     )
-    eval_use_llm_obs_wrappers: List[bool] = field(default_factory=lambda: [False, True])
+    eval_use_llm_obs_wrappers: List[bool] = field(default_factory=lambda: [True])
     eval_opponent_names: List[str] = field(
-        default_factory=lambda: ["random"]
+        default_factory=lambda: ["cfr_plus"]
     )
     eval_prompt_template: Literal["qwen3_general"] = "qwen3_general"
 
@@ -112,19 +120,19 @@ class SelfPlayArgs(PPOArgs):
 
 
 """
-2. Instantiate the actor based on Oat's PPOActor, which generates the self-play experiences.
+3. Instantiate the actor based on Oat's PPOActor, which generates the training experiences against CFR+.
 """
 
 
-class SelfPlayActor(PPOActor):
-    """Actor class for self-play reinforcement learning."""
+class GTOTrainingActor(PPOActor):
+    """Actor class for GTO training against CFR+ opponent."""
 
     def init(self, actor_id, save_path):
         super().init(actor_id, save_path)
         self.game_state_save_path = os.path.join(self.save_path, "game_state")
         if actor_id == 0:
             os.makedirs(self.game_state_save_path, exist_ok=True)
-        self.args: SelfPlayArgs = self.args
+        self.args: GTOTrainingArgs = self.args
         args = self.args
         self.oracle = MATHOracle(
             args.eval_prompt_template, "fast", correct_reward=1, incorrect_reward=0
@@ -136,7 +144,7 @@ class SelfPlayActor(PPOActor):
             top_p=args.top_p,
             top_k=args.top_k,
             max_tokens=args.generate_max_length,
-            n=1,  # Override to only generate 1 response per prompt for self-play
+            n=1,  # Override to only generate 1 response per prompt
             logprobs=True,
         )
 
@@ -145,16 +153,20 @@ class SelfPlayActor(PPOActor):
             top_p=args.eval_top_p,
             top_k=args.eval_top_k,
             max_tokens=args.eval_generate_max_length,
-            n=1,  # Override to only generate 1 response per prompt for self-play
+            n=1,  # Override to only generate 1 response per prompt
             logprobs=True,
         )
 
         self.step_count = 0
         self.online_model_player = actor_id % 2
-        if self.args.fixed_opponent not in ["", "random"]:
-            self.open_router_opponent = ta.agents.OpenRouterAgent(
-                self.args.fixed_opponent
-            )
+        
+        # Initialize CFR+ agent
+        if args.cfr_strategy_path:
+            self.cfr_agent = CFRPlusAgent(args.cfr_strategy_path)
+            logging.info(f"Loaded CFR+ strategy from {args.cfr_strategy_path}")
+        else:
+            raise ValueError("cfr_strategy_path must be provided for GTO training")
+            
         if self.args.use_role_baseline:
             self.role_baseline_ema = {
                 0: EMA(self.args.role_baseline_ema_gamma),
@@ -164,7 +176,7 @@ class SelfPlayActor(PPOActor):
 
     def step(
         self, prompts=None, formatted_prompts=None, references=None
-    ) -> List[TrajectoryData]:
+    ) -> bytes:
         """
         Override step method to play full games rather than single-turn inference.
 
@@ -229,7 +241,7 @@ class SelfPlayActor(PPOActor):
         )
 
         for i, env in enumerate(vec_envs):
-            env.reset(num_players=2, seed=seed + i)
+            env.reset(num_players=2, seed=(seed or 0) + i)
             env.state.error_allowance = 0
 
         # Initialize game state
@@ -260,22 +272,15 @@ class SelfPlayActor(PPOActor):
 
             _mean_pid = np.mean([x for x in vec_player_id if x is not None])
             assert _mean_pid == 0 or _mean_pid == 1, "vec_env player_id not consistent"
-            _curr_pid = vec_player_id[0]
+            _curr_pid = vec_player_id[0] if vec_player_id[0] is not None else 0
 
-            # --- [BEGIN] Fixed Opponent Logic Init ---
-            agent_act = self.agent_act
-            _fixed_opponent = ""
-            if self.args.fixed_opponent and _curr_pid == 1 - self.online_model_player:
-                logging.info(
-                    f"player{_curr_pid} using fixed opponent={self.args.fixed_opponent}"
-                )
-                _fixed_opponent = self.args.fixed_opponent
-                agent_act = partial(
-                    self.fixed_opponent_act, opponent_type=_fixed_opponent
-                )
-            # --- [END] Fixed Opponent Logic Init ---
-
-            vec_action, vec_extras = agent_act(vec_observation, env_id=env_id)
+            # Determine which agent acts
+            if _curr_pid == self.online_model_player:
+                # Online model acts
+                vec_action, vec_extras = self.agent_act(vec_observation, env_id=env_id)
+            else:
+                # CFR+ agent acts
+                vec_action, vec_extras = self.cfr_agent_act(vec_observation, env_id=env_id)
 
             for i in range(self.args.num_envs):
                 if not vec_done[i]:
@@ -292,9 +297,7 @@ class SelfPlayActor(PPOActor):
                             "prompt": observation,
                             "action": action,
                             "action_is_valid": action != INVALID_ACTION,
-                            "player_id": (
-                                player_id if not _fixed_opponent else _fixed_opponent
-                            ),
+                            "player_id": player_id,
                             "turn": game_state.turn_count,
                             **extras,
                         },
@@ -341,6 +344,7 @@ class SelfPlayActor(PPOActor):
             if vec_rewards[i] is None:
                 assert vec_done[i]
                 vec_rewards[i] = vec_envs[i].close()
+                
         # Dump the game state for debugging.
         if (
             self.args.dump_game_state_every > 0
@@ -379,9 +383,10 @@ class SelfPlayActor(PPOActor):
 
         return trajectories
 
-    def fixed_opponent_act(
-        self, vec_observation: List[str], env_id: str, opponent_type: str = "random"
-    ) -> Tuple[str, dict]:
+    def cfr_agent_act(
+        self, vec_observation: List[str], env_id: str
+    ) -> Tuple[List[str], List[dict]]:
+        """Use CFR+ agent to act."""
         clean_actions = []
         extras = []
         for observation in vec_observation:
@@ -390,32 +395,27 @@ class SelfPlayActor(PPOActor):
                 extras.append(None)
                 continue
 
-            if opponent_type == "random":
-                clean_action = RandomAgent(env_id)(observation)
-            else:
-                # Not clean_action, but env will parse the last [x].
-                clean_action = self.open_router_opponent(observation)
-
+            clean_action = self.cfr_agent(observation)
             clean_actions.append(clean_action)
             extras.append(
                 {
                     "formatted_observation": "",
                     "prompt_ids": [],
-                    "response": f"This action is taken by a fixed agent: {opponent_type}",
+                    "response": f"This action is taken by CFR+ agent",
                     "response_ids": [],
                     "response_is_truncated": True,
                 }
             )
         return clean_actions, extras
 
-    def agent_act(self, vec_observation: List[str], env_id: str) -> Tuple[str, dict]:
+    def agent_act(self, vec_observation: List[str], env_id: str) -> Tuple[List[str], List[dict]]:
         """Use the current LLM as a policy to act.
 
         Args:
             vec_observation: Vectorized observation from TextArena environment.
 
         Returns:
-            Tuple[str, dict]: Action and extra data.
+            Tuple[List[str], List[dict]]: Action and extra data.
 
         """
         clean_actions = []
@@ -459,6 +459,7 @@ class SelfPlayActor(PPOActor):
                     "response_is_truncated": response_is_truncated,
                 }
             )
+            i += 1
         return clean_actions, extras
 
     def prepare_trajectories(
@@ -472,13 +473,12 @@ class SelfPlayActor(PPOActor):
             rewards: Final rewards for each player
 
         Returns:
-            List of trajectory data
+            List of trajectory data for the online model only
         """
         trajectory_data = []
 
-        player_ids_for_training = [0, 1]
-        if self.args.fixed_opponent:
-            player_ids_for_training = [self.online_model_player]
+        # Only train on the online model's trajectories, not CFR+ agent
+        player_ids_for_training = [self.online_model_player]
         logging.info(f"player_ids_for_training: {player_ids_for_training}")
 
         for player_id in player_ids_for_training:
@@ -520,8 +520,7 @@ class SelfPlayActor(PPOActor):
                         prompt_ids=step_data["prompt_ids"],
                         response=step_data["response"],
                         response_ids=step_data["response_ids"],
-                        response_logprobs=None,  # Re-calculated on learner side.
-                        # response_logprobs=step_data["response_logprobs"],
+                        response_logprobs=[],  # Re-calculated on learner side.
                         rewards=dense_rewards,
                         loss_mask=(
                             not step_data["response_is_truncated"]
@@ -661,14 +660,21 @@ class SelfPlayActor(PPOActor):
         assert self.eval_mode
 
         opponent_id = 1 - player_id
-        agents = {
-            player_id: lambda obs: self.agent_act([obs], env_id)[0][0],
-            opponent_id: (
-                RandomAgent(env_id)
-                if opponent_name == "random"
-                else ta.agents.OpenRouterAgent(opponent_name)
-            ),
-        }
+        
+        if opponent_name == "cfr_plus":
+            agents = {
+                player_id: lambda obs: self.agent_act([obs], env_id)[0][0],
+                opponent_id: self.cfr_agent,
+            }
+        else:
+            agents = {
+                player_id: lambda obs: self.agent_act([obs], env_id)[0][0],
+                opponent_id: (
+                    RandomAgent(env_id)
+                    if opponent_name == "random"
+                    else ta.agents.OpenRouterAgent(opponent_name)
+                ),
+            }
 
         _use_llm_obs_wrapper = dict(
             zip(self.args.eval_env_ids, self.args.eval_use_llm_obs_wrappers)
@@ -725,16 +731,16 @@ class SelfPlayActor(PPOActor):
 
 
 """
-3. Instantiate the learner based on PPOLearner. Here we adapt the `evaluate` logic to run online evaluation for both game and math.
+4. Instantiate the learner based on PPOLearner. Here we adapt the `evaluate` logic to run online evaluation for both game and math.
 """
 
 
-class SelfPlayLearner(PPOLearner):
-    """Learner class for self-play reinforcement learning."""
+class GTOTrainingLearner(PPOLearner):
+    """Learner class for GTO training against CFR+ opponent."""
 
-    def _init(self, args: SelfPlayArgs, actors: List[ActorBase]) -> None:
+    def _init(self, args: GTOTrainingArgs, actors: List[ActorBase]) -> None:
         """
-        Initialize the self-play learner.
+        Initialize the GTO training learner.
 
         CRITICAL: We override this method to skip OAT's dataset loading mechanism.
         """
@@ -780,15 +786,18 @@ class SelfPlayLearner(PPOLearner):
         )
 
         # Load any other reasoning benchmark for online eval
-        self.eval_dataset_dict = load_data_from_disk_or_hf(args.eval_data)
-        if args.eval_split != "all":
-            self.eval_dataset_dict = {
-                k: v
-                for k, v in self.eval_dataset_dict.items()
-                if k in args.eval_split.split(",")
-            }
+        if self.args.eval_data:
+            self.eval_dataset_dict = load_data_from_disk_or_hf(self.args.eval_data)
+            if self.args.eval_split != "all":
+                self.eval_dataset_dict = {
+                    k: v
+                    for k, v in self.eval_dataset_dict.items()
+                    if k in self.args.eval_split.split(",")
+                }
+        else:
+            self.eval_dataset_dict = {}
 
-        strategy.print("Using dummy dataset for self-play (no external data needed)")
+        strategy.print("Using dummy dataset for GTO training (no external data needed)")
 
     def eval_dataloader_collate_fn(self, item_list):
         problems = []
@@ -828,7 +837,7 @@ class SelfPlayLearner(PPOLearner):
         Online evaluation with hierarchical metrics.
 
         We do three things here:
-        1) Evaluation on games, either in-domain or out-domain, against various opponents (random, rule-based, LLMs);
+        1) Evaluation on games, either in-domain or out-domain, against various opponents (random, rule-based, CFR+);
         2) Evaluation on general reasoning tasks, including math, etc.
         """
         del _unused_dataloader
@@ -877,7 +886,15 @@ class SelfPlayLearner(PPOLearner):
 
             for i, (env_id, opponent_name, game_nr) in enumerate(eval_runs_list):
                 actor = self.actors[i % len(self.actors)]
-                futs.append(actor.futures.run_eval_episode(env_id, opponent_name))
+                # Use a mock future object for compatibility
+                class MockFuture:
+                    def __init__(self, result):
+                        self._result = result
+                    def result(self):
+                        return self._result
+                
+                result = actor.run_eval_episode(env_id, opponent_name)
+                futs.append(MockFuture(result))
 
                 # Process results in batches
                 if len(futs) == len(self.actors) or i == len(eval_runs_list) - 1:
@@ -934,13 +951,15 @@ class SelfPlayLearner(PPOLearner):
             accuracies.append(metrics["eval/accuracy"])
             scores.append(metrics["eval/score"])
             lens.append(metrics["eval/response_tok_len"])
-        non_game_metrics.update(
-            {
-                "eval/general/average/accuracy": np.mean(accuracies),
-                "eval/general/average/score": np.mean(scores),
-                "eval/general/average/response_tok_len": np.mean(lens),
-            }
-        )
+            
+        if accuracies:  # Only compute averages if we have data
+            non_game_metrics.update(
+                {
+                    "eval/general/average/accuracy": np.mean(accuracies),
+                    "eval/general/average/score": np.mean(scores),
+                    "eval/general/average/response_tok_len": np.mean(lens),
+                }
+            )
 
         # ------------------------------------------------------------------
         # Synchronize metrics across all ranks
@@ -953,20 +972,20 @@ class SelfPlayLearner(PPOLearner):
 
 
 """
-4. Compose the distributed program.
+5. Compose the distributed program.
 """
 
 
-def run_self_play_rl(args: SelfPlayArgs):
+def run_gto_training(args: GTOTrainingArgs):
     """
-    Run the self-play reinforcement learning training pipeline.
+    Run the GTO training pipeline against CFR+ opponent.
 
     Args:
         args: Configuration arguments for the run
     """
     # Define a distributed program that composes Actors and Learners
     program, local_resources = get_program(
-        args, learner_cls=SelfPlayLearner, actor_cls=SelfPlayActor
+        args, learner_cls=GTOTrainingLearner, actor_cls=GTOTrainingActor
     )
 
     # Launch the program
@@ -979,12 +998,12 @@ def run_self_play_rl(args: SelfPlayArgs):
 
 
 """
-5. Argument validation and entry point.
+6. Argument validation and entry point.
 """
 
 if __name__ == "__main__":
     # Get default arguments and customize them
-    args: SelfPlayArgs = get_default_args(SelfPlayArgs)
+    args = get_default_args(GTOTrainingArgs)
 
     # Customization
     args.algo = "PPO"
@@ -992,10 +1011,15 @@ if __name__ == "__main__":
 
     # CRITICAL: Disable oracle and dataset loading
     args.oracle = ""  # Empty string for no external oracle
-    args.prompt_data = None  # Don't load any dataset
+    # Remove problematic assignment that doesn't exist
+    # args.prompt_data = None  # Don't load any dataset
 
     args = default_args_validation(args)
 
+    # Validation for CFR+ training
+    if not args.cfr_strategy_path:
+        raise ValueError("--cfr_strategy_path must be provided for GTO training")
+    
     if "KuhnPoker-v1" == args.env_id:
         assert args.num_envs == 1, "Please set --num_envs 1 for KuhnPoker-v1"
         assert (
@@ -1012,4 +1036,4 @@ if __name__ == "__main__":
     assert len(args.eval_env_ids) == len(args.eval_use_llm_obs_wrappers)
 
     # Let's go
-    run_self_play_rl(args)
+    run_gto_training(args) 
